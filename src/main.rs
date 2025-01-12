@@ -4,7 +4,6 @@ use std::{
     collections::{HashMap, HashSet},
     mem::MaybeUninit,
     ops::Not,
-    u32,
 };
 
 use gpui::*;
@@ -20,6 +19,7 @@ pub struct Global {
     handle: HHOOK,
     action: Action,
     dirty: bool,
+    keyboard: Box<[u8; 256]>,
 
     disable: HashSet<u16>,
     mappings: HashMap<u16, Vec<Mapping>>,
@@ -70,7 +70,7 @@ impl Global {
         println!("start recording output");
         self.action = match std::mem::replace(&mut self.action, Action::Normal) {
             Action::RecordIn { keyboard, key } => {
-                let key_2 = virtual_key_to_unicode(&keyboard, key).unwrap();
+                let key_2 = virtual_key_to_unicode(&keyboard, key);
                 println!("In: {:?}", key_2);
                 Action::StartRecordOut {
                     in_keyboard: keyboard,
@@ -94,8 +94,20 @@ impl Global {
                 out_keyboard,
                 out_key,
             } => {
-                let key_2 = virtual_key_to_unicode(&out_keyboard, out_key).unwrap();
-                println!("Out: {:?}", key_2);
+                let key_in = virtual_key_to_unicode(&in_keyboard, in_key);
+                let key_out = virtual_key_to_unicode(&out_keyboard, out_key);
+                println!("Map: {:?} {:?}", key_in, key_out);
+                for i in 0..256 {
+                    if in_keyboard[i] != 0 {
+                        println!("  In: {:?}", i);
+                    }
+                }
+                for i in 0..256 {
+                    if out_keyboard[i] != 0 {
+                        println!("  Out: {:?}", i);
+                    }
+                }
+
                 self.mappings.entry(in_key.0).or_default().push(Mapping {
                     in_keyboard,
                     out_keyboard,
@@ -114,16 +126,14 @@ impl Global {
         let Some(mappings) = self.mappings.get(&key.0) else {
             return Status::Allow;
         };
-        let mut keyboard = Box::new([0u8; 256]);
-        unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
 
         for mapping in mappings.iter() {
             let valid = mapping
                 .in_keyboard
                 .iter()
                 .copied()
-                .zip(keyboard.iter().copied())
-                .all(|(in_key, current)| current & 0x80 == 0 || in_key & 0x80 != 0);
+                .zip(self.keyboard.iter().copied())
+                .all(|(target, current)| current & 0x80 != 0 || target & 0x80 == 0);
 
             if valid.not() {
                 continue;
@@ -157,6 +167,10 @@ impl Global {
     }
 
     fn handle_real_key(&mut self, key: VIRTUAL_KEY, state: KeyState) -> Status {
+        if state.released() {
+            self.set_key(key, state);
+        }
+
         let (action, status) = match std::mem::replace(&mut self.action, Action::Normal) {
             Action::Normal => (Action::Normal, self.mapped_key(key, state)),
 
@@ -167,9 +181,12 @@ impl Global {
 
             Action::StartRecordIn | Action::RecordIn { .. } if state.pressed() => {
                 self.dirty = true;
-                let mut keyboard = Box::new([0u8; 256]);
-                unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
+                let keyboard = self.keyboard.clone();
+
+                println!("In: {:?}", virtual_key_to_unicode(&keyboard, key));
+
                 let action = Action::RecordIn { keyboard, key };
+
                 (action, Status::Allow)
             }
             Action::StartRecordOut {
@@ -182,9 +199,9 @@ impl Global {
                 ..
             } if state.pressed() => {
                 self.dirty = true;
-                let mut keyboard = Box::new([0u8; 256]);
-                unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
+                let keyboard = self.keyboard.clone();
                 self.dirty = true;
+                println!("Out: {:?}", virtual_key_to_unicode(&keyboard, key));
                 let action = Action::RecordOut {
                     in_keyboard,
                     in_key,
@@ -195,8 +212,31 @@ impl Global {
             }
             action => (action, Status::Allow),
         };
+        if state.pressed() {
+            self.set_key(key, state);
+        }
         self.action = action;
         status
+    }
+
+    fn set_key(&mut self, key: VIRTUAL_KEY, state: KeyState) {
+        let value = match state {
+            KeyState::Pressed => 0x80,
+            KeyState::Released => 0,
+        };
+        self.keyboard[key.0 as usize] = value;
+
+        match key {
+            VK_LSHIFT | VK_RSHIFT => self.combine_keys(VK_SHIFT, VK_LSHIFT, VK_RSHIFT),
+            VK_LCONTROL | VK_RCONTROL => self.combine_keys(VK_CONTROL, VK_LCONTROL, VK_RCONTROL),
+            VK_LMENU | VK_RMENU => self.combine_keys(VK_MENU, VK_LMENU, VK_RMENU),
+            _ => {}
+        }
+    }
+
+    fn combine_keys(&mut self, target: VIRTUAL_KEY, left: VIRTUAL_KEY, right: VIRTUAL_KEY) {
+        self.keyboard[target.0 as usize] =
+            self.keyboard[left.0 as usize] | self.keyboard[right.0 as usize]
     }
 }
 
@@ -249,18 +289,16 @@ extern "system" fn low_level_keyboard_proc(
 ) -> LRESULT {
     let global = unsafe { GLOBAL.assume_init_mut() };
 
-    if n_code as u32 == HC_ACTION {
-        let kb_struct = unsafe { &*(l_param.0 as *const KBDLLHOOKSTRUCT) };
-
-        if w_param == WPARAM(WM_KEYDOWN as usize)
+    if n_code as u32 == HC_ACTION
+        && (w_param == WPARAM(WM_KEYDOWN as usize)
             || w_param == WPARAM(WM_SYSKEYDOWN as usize)
             || w_param == WPARAM(WM_KEYUP as usize)
-            || w_param == WPARAM(WM_SYSKEYUP as usize)
-        {
-            match global.handle_key(kb_struct) {
-                Status::Intercept => return LRESULT(1),
-                Status::Allow => {}
-            }
+            || w_param == WPARAM(WM_SYSKEYUP as usize))
+    {
+        let kb_struct = unsafe { &*(l_param.0 as *const KBDLLHOOKSTRUCT) };
+        match global.handle_key(kb_struct) {
+            Status::Intercept => return LRESULT(1),
+            Status::Allow => {}
         }
     }
 
@@ -278,6 +316,8 @@ fn main() {
             action: Action::Normal,
             dirty: false,
 
+            keyboard: Box::new([0; 256]),
+
             disable: HashSet::new(),
             mappings: HashMap::new(),
         })
@@ -290,7 +330,7 @@ fn main() {
                 GlobalModel {}
             });
             let ui = cx.new_view(|_cx| UI {
-                global: global.clone(),
+                _global: global.clone(),
             });
 
             cx.subscribe(&global, |global, _event: &GlobalModelCheck, cx| {
@@ -331,7 +371,7 @@ fn main() {
 }
 
 struct UI {
-    global: Model<GlobalModel>,
+    _global: Model<GlobalModel>,
 }
 
 struct GlobalModel {}
@@ -391,12 +431,10 @@ impl gpui::Render for UI {
     }
 }
 
-fn virtual_key_to_unicode(keyboard: &[u8; 256], vk_code: VIRTUAL_KEY) -> Option<char> {
-    // Buffer to hold the result character
+fn virtual_key_to_unicode(keyboard: &[u8; 256], vk_code: VIRTUAL_KEY) -> char {
     let mut unicode_buffer = [0u16; 2];
 
-    // Translate virtual key to Unicode
-    let result = unsafe {
+    unsafe {
         ToUnicodeEx(
             vk_code.0 as u32,
             MapVirtualKeyW(vk_code.0 as u32, MAPVK_VK_TO_VSC),
@@ -407,10 +445,9 @@ fn virtual_key_to_unicode(keyboard: &[u8; 256], vk_code: VIRTUAL_KEY) -> Option<
         )
     };
 
-    // If exactly one character was translated, return it
-    if result == 1 {
-        return Some(char::from_u32(unicode_buffer[0] as u32).unwrap());
-    }
-
-    None
+    String::from_utf16(&unicode_buffer)
+        .unwrap()
+        .chars()
+        .next()
+        .unwrap()
 }
