@@ -1,9 +1,8 @@
 #![allow(static_mut_refs)]
 
 use std::{
-    collections::{HashMap, HashSet},
-    mem::MaybeUninit,
     ops::Not,
+    sync::{LazyLock, Mutex},
 };
 
 use gpui::*;
@@ -12,53 +11,61 @@ use windows::Win32::{
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
-static mut GLOBAL: MaybeUninit<Global> = MaybeUninit::uninit();
+// todo?: use mutex
+static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| Mutex::new(Global::new()));
+
+#[derive(Debug, Clone, IntoElement)]
+pub struct Stroke {
+    keyboard: Box<[u8; 256]>,
+    key: VIRTUAL_KEY,
+}
+
+impl RenderOnce for Stroke {
+    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
+        div()
+            .border_color(white())
+            .border_2()
+            .text_color(white())
+            .w_full()
+            .flex()
+            .justify_center()
+            .rounded(px(3.0))
+            .child(format!("{}", self.char()))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Mapping {
+    input: Option<Stroke>,
+    output: Option<Stroke>,
+}
 
 #[derive(Debug)]
 pub struct Global {
-    handle: HHOOK,
     action: Action,
     dirty: bool,
     keyboard: Box<[u8; 256]>,
 
-    disable: HashSet<u16>,
-    mappings: HashMap<u16, Vec<Mapping>>,
-}
-
-#[derive(Debug)]
-struct Mapping {
-    in_keyboard: Box<[u8; 256]>,
-    out_keyboard: Box<[u8; 256]>,
-    key: VIRTUAL_KEY,
+    mappings: Vec<Mapping>,
 }
 
 #[derive(Debug)]
 pub enum Action {
     Normal,
-    StartDisable,
-    Disable(VIRTUAL_KEY),
     StartRecordIn,
-    RecordIn {
-        keyboard: Box<[u8; 256]>,
-        key: VIRTUAL_KEY,
-    },
-    StartRecordOut {
-        in_keyboard: Box<[u8; 256]>,
-        in_key: VIRTUAL_KEY,
-    },
-    RecordOut {
-        in_keyboard: Box<[u8; 256]>,
-        in_key: VIRTUAL_KEY,
-
-        out_keyboard: Box<[u8; 256]>,
-        out_key: VIRTUAL_KEY,
-    },
+    RecordIn(Stroke),
+    StartRecordOut(Stroke),
+    RecordOut { input: Stroke, output: Stroke },
 }
 
 impl Global {
-    pub fn start_disable(&mut self) {
-        println!("start disable");
-        self.action = Action::StartDisable;
+    pub fn new() -> Self {
+        Self {
+            action: Action::Normal,
+            mappings: Vec::new(),
+            dirty: false,
+            keyboard: Box::new([0; 256]),
+        }
     }
 
     pub fn start_recording_input(&mut self) {
@@ -69,13 +76,9 @@ impl Global {
     pub fn start_recording_output(&mut self) {
         println!("start recording output");
         self.action = match std::mem::replace(&mut self.action, Action::Normal) {
-            Action::RecordIn { keyboard, key } => {
-                let key_2 = virtual_key_to_unicode(&keyboard, key);
-                println!("In: {:?}", key_2);
-                Action::StartRecordOut {
-                    in_keyboard: keyboard,
-                    in_key: key,
-                }
+            Action::RecordIn(stroke) => {
+                println!("In: {:?}", stroke.char());
+                Action::StartRecordOut(stroke)
             }
             action => action,
         };
@@ -84,35 +87,23 @@ impl Global {
     pub fn end_recording(&mut self) {
         println!("end recording");
         self.action = match std::mem::replace(&mut self.action, Action::Normal) {
-            Action::Disable(key) => {
-                self.disable.insert(key.0);
-                Action::Normal
-            }
-            Action::RecordOut {
-                in_keyboard,
-                in_key,
-                out_keyboard,
-                out_key,
-            } => {
-                let key_in = virtual_key_to_unicode(&in_keyboard, in_key);
-                let key_out = virtual_key_to_unicode(&out_keyboard, out_key);
-                println!("Map: {:?} {:?}", key_in, key_out);
+            Action::RecordOut { input, output } => {
+                println!("Map: {:?} {:?}", input.char(), output.char());
                 for i in 0..256 {
-                    if in_keyboard[i] != 0 {
+                    if input.keyboard[i] != 0 {
                         println!("  In: {:?}", i);
                     }
                 }
                 for i in 0..256 {
-                    if out_keyboard[i] != 0 {
+                    if output.keyboard[i] != 0 {
                         println!("  Out: {:?}", i);
                     }
                 }
-
-                self.mappings.entry(in_key.0).or_default().push(Mapping {
-                    in_keyboard,
-                    out_keyboard,
-                    key: out_key,
+                self.mappings.push(Mapping {
+                    input: Some(input),
+                    output: Some(output),
                 });
+                self.dirty = true;
                 Action::Normal
             }
             action => action,
@@ -120,16 +111,17 @@ impl Global {
     }
 
     pub fn mapped_key(&self, key: VIRTUAL_KEY, state: KeyState) -> Status {
-        if self.disable.contains(&key.0) {
-            return Status::Intercept;
-        }
-        let Some(mappings) = self.mappings.get(&key.0) else {
-            return Status::Allow;
-        };
+        for mapping in self.mappings.iter() {
+            let Some(input) = &mapping.input else {
+                continue;
+            };
 
-        for mapping in mappings.iter() {
-            let valid = mapping
-                .in_keyboard
+            if input.key != key {
+                continue;
+            }
+
+            let valid = input
+                .keyboard
                 .iter()
                 .copied()
                 .zip(self.keyboard.iter().copied())
@@ -142,11 +134,10 @@ impl Global {
             let mut keyboard = Box::new([0u8; 256]);
             unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
 
-            unsafe { SetKeyboardState(&mapping.out_keyboard) }.unwrap();
-            send_key(mapping.key, state);
-            unsafe { SetKeyboardState(&keyboard) }.unwrap();
-
-            return Status::Intercept;
+            return match mapping.output.clone() {
+                Some(stroke) => Status::Replace { stroke, state },
+                None => Status::Intercept,
+            };
         }
         Status::Allow
     }
@@ -174,40 +165,23 @@ impl Global {
         let (action, status) = match std::mem::replace(&mut self.action, Action::Normal) {
             Action::Normal => (Action::Normal, self.mapped_key(key, state)),
 
-            Action::StartDisable | Action::Disable(_) if state.pressed() => {
-                self.dirty = true;
-                (Action::Disable(key), Status::Allow)
-            }
-
             Action::StartRecordIn | Action::RecordIn { .. } if state.pressed() => {
                 self.dirty = true;
                 let keyboard = self.keyboard.clone();
+                let stroke = Stroke { key, keyboard };
 
-                println!("In: {:?}", virtual_key_to_unicode(&keyboard, key));
+                println!("In: {:?}", stroke.char());
 
-                let action = Action::RecordIn { keyboard, key };
+                let action = Action::RecordIn(stroke);
 
                 (action, Status::Allow)
             }
-            Action::StartRecordOut {
-                in_keyboard,
-                in_key,
-            }
-            | Action::RecordOut {
-                in_keyboard,
-                in_key,
-                ..
-            } if state.pressed() => {
+            Action::StartRecordOut(input) | Action::RecordOut { input, .. } if state.pressed() => {
                 self.dirty = true;
                 let keyboard = self.keyboard.clone();
-                self.dirty = true;
-                println!("Out: {:?}", virtual_key_to_unicode(&keyboard, key));
-                let action = Action::RecordOut {
-                    in_keyboard,
-                    in_key,
-                    out_keyboard: keyboard,
-                    out_key: key,
-                };
+                let output = Stroke { key, keyboard };
+                println!("Out: {:?}", output.char());
+                let action = Action::RecordOut { input, output };
                 (action, Status::Allow)
             }
             action => (action, Status::Allow),
@@ -259,6 +233,7 @@ impl KeyState {
 pub enum Status {
     Intercept,
     Allow,
+    Replace { stroke: Stroke, state: KeyState },
 }
 
 fn send_key(key: VIRTUAL_KEY, state: KeyState) {
@@ -287,8 +262,6 @@ extern "system" fn low_level_keyboard_proc(
     w_param: WPARAM,
     l_param: LPARAM,
 ) -> LRESULT {
-    let global = unsafe { GLOBAL.assume_init_mut() };
-
     if n_code as u32 == HC_ACTION
         && (w_param == WPARAM(WM_KEYDOWN as usize)
             || w_param == WPARAM(WM_SYSKEYDOWN as usize)
@@ -296,13 +269,66 @@ extern "system" fn low_level_keyboard_proc(
             || w_param == WPARAM(WM_SYSKEYUP as usize))
     {
         let kb_struct = unsafe { &*(l_param.0 as *const KBDLLHOOKSTRUCT) };
-        match global.handle_key(kb_struct) {
+
+        let mut global = GLOBAL.lock().unwrap();
+        let stroke = match global.handle_key(kb_struct) {
             Status::Intercept => return LRESULT(1),
-            Status::Allow => {}
+            Status::Replace { stroke, state } => Some((stroke, state)),
+            Status::Allow => None,
+        };
+        drop(global);
+        if let Some((stroke, state)) = stroke {
+            unsafe { SetKeyboardState(&stroke.keyboard) }.unwrap();
+            send_key(stroke.key, state);
+            unsafe { SetKeyboardState(&stroke.keyboard) }.unwrap();
+            return LRESULT(1);
         }
     }
 
     unsafe { CallNextHookEx(None, n_code, w_param, l_param) }
+}
+
+fn create_list_state(facade: Model<Facade>) -> ListState {
+    let items = GLOBAL.lock().unwrap().mappings.clone();
+
+    ListState::new(
+        items.len(),
+        ListAlignment::Top,
+        px(20.0),
+        move |idx, _cx| {
+            let facade = facade.clone();
+            div()
+                .flex()
+                .flex_row()
+                .w_full()
+                .gap_2()
+                .py_2()
+                .child(match items[idx].input.clone() {
+                    Some(stroke) => stroke.into_any_element(),
+                    None => div().into_any_element(),
+                })
+                .child(">")
+                .child(match items[idx].output.clone() {
+                    Some(stroke) => stroke.into_any_element(),
+                    None => div().into_any_element(),
+                })
+                .child("|")
+                .child(
+                    div()
+                        .on_mouse_down(MouseButton::Left, move |_, cx| {
+                            cx.update_model(&facade, |_, cx| cx.emit(GlobalDelete(idx)))
+                        })
+                        .border_2()
+                        .border_color(white())
+                        .rounded(px(5.0))
+                        .w_20()
+                        .flex()
+                        .justify_center()
+                        .child("X"),
+                )
+                .into_any_element()
+        },
+    )
 }
 
 fn main() {
@@ -310,53 +336,58 @@ fn main() {
         SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0).unwrap()
     };
 
-    unsafe {
-        GLOBAL.write(Global {
-            handle,
-            action: Action::Normal,
-            dirty: false,
-
-            keyboard: Box::new([0; 256]),
-
-            disable: HashSet::new(),
-            mappings: HashMap::new(),
-        })
-    };
-
     gpui::App::new().run(|cx| {
         cx.open_window(gpui::WindowOptions::default(), |cx| {
-            let global = cx.new_model(|cx| {
+            let facade = cx.new_model(|cx| {
                 cx.notify();
-                GlobalModel {}
+                Facade {}
             });
+            let list = ListState::new(0, ListAlignment::Top, px(20.0), move |_, _| unreachable!());
             let ui = cx.new_view(|_cx| UI {
-                _global: global.clone(),
+                list,
+                _facade: facade.clone(),
             });
 
-            cx.subscribe(&global, |global, _event: &GlobalModelCheck, cx| {
-                let context = unsafe { GLOBAL.assume_init_mut() };
-                if context.dirty {
-                    context.dirty = false;
-                    cx.update_model(&global, |_, cx| cx.emit(GlobalModelChanged));
+            cx.subscribe(&facade, |facade, _event: &FacadeCheck, cx| {
+                let mut global = GLOBAL.lock().unwrap();
+                if global.dirty {
+                    global.dirty = false;
+                    cx.update_model(&facade, |_, cx| cx.emit(GlobalChanged));
                 }
 
                 cx.on_next_frame(move |cx| {
-                    cx.update_model(&global, |_, cx| cx.emit(GlobalModelCheck));
+                    cx.update_model(&facade, |_, cx| cx.emit(FacadeCheck));
                 });
             })
             .detach();
 
             {
-                let global = global.clone();
+                let facade = facade.clone();
                 cx.on_next_frame(move |cx| {
-                    cx.update_model(&global, |_, cx| cx.emit(GlobalModelCheck));
+                    cx.update_model(&facade, |_, cx| cx.emit(FacadeCheck));
                 });
             }
 
             {
                 let ui = ui.clone();
-                cx.subscribe(&global, move |_global, _event: &GlobalModelChanged, cx| {
-                    cx.update_view(&ui, |_, cx| cx.notify());
+                cx.subscribe(&facade, move |facade, _event: &GlobalChanged, cx| {
+                    cx.update_view(&ui, |ui, cx| {
+                        ui.list = create_list_state(facade);
+                        cx.notify()
+                    });
+                })
+                .detach();
+            }
+
+            {
+                cx.subscribe(&facade, move |_facade, event: &GlobalDelete, _cx| {
+                    let mut global = GLOBAL.lock().unwrap();
+                    if event.0 >= global.mappings.len() {
+                        println!("Remove out of bounds of mappings, how?");
+                        return;
+                    }
+                    global.mappings.swap_remove(event.0);
+                    global.dirty = true;
                 })
                 .detach();
             }
@@ -367,87 +398,99 @@ fn main() {
         cx.activate(true);
     });
 
-    unsafe { UnhookWindowsHookEx(GLOBAL.assume_init_ref().handle) }.unwrap();
+    unsafe { UnhookWindowsHookEx(handle) }.unwrap();
 }
 
 struct UI {
-    _global: Model<GlobalModel>,
+    _facade: Model<Facade>,
+    list: ListState,
 }
 
-struct GlobalModel {}
+struct Facade {}
 
-struct GlobalModelCheck;
-impl EventEmitter<GlobalModelCheck> for GlobalModel {}
+struct FacadeCheck;
+impl EventEmitter<FacadeCheck> for Facade {}
 
-struct GlobalModelChanged;
-impl EventEmitter<GlobalModelChanged> for GlobalModel {}
+struct GlobalChanged;
+impl EventEmitter<GlobalChanged> for Facade {}
+
+struct GlobalDelete(usize);
+impl EventEmitter<GlobalDelete> for Facade {}
 
 impl gpui::Render for UI {
     fn render(&mut self, cx: &mut gpui::ViewContext<Self>) -> impl gpui::IntoElement {
-        //println!("render");
         div()
             .text_color(white())
-            .child("UI")
+            .flex()
+            .flex_col()
+            .w_full()
+            .h_full()
             .child(
                 div()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |_ui, _event, _cx| {
-                            unsafe { GLOBAL.assume_init_mut() }.start_disable()
-                        }),
+                    .flex()
+                    .flex_row()
+                    .gap_5()
+                    .child(
+                        div()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_ui, _event, _cx| {
+                                    GLOBAL.lock().unwrap().start_recording_input();
+                                }),
+                            )
+                            .child("Input"),
                     )
-                    .child("Disable"),
+                    .child(
+                        div()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_ui, _event, _cx| {
+                                    GLOBAL.lock().unwrap().start_recording_output();
+                                }),
+                            )
+                            .child("Output"),
+                    )
+                    .child(
+                        div()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |_ui, _event, _cx| {
+                                    GLOBAL.lock().unwrap().end_recording();
+                                }),
+                            )
+                            .child("Save"),
+                    ),
             )
             .child(
-                div()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |_ui, _event, _cx| {
-                            unsafe { GLOBAL.assume_init_mut() }.start_recording_input()
-                        }),
-                    )
-                    .child("Input"),
-            )
-            .child(
-                div()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |_ui, _event, _cx| {
-                            unsafe { GLOBAL.assume_init_mut() }.start_recording_output()
-                        }),
-                    )
-                    .child("Output"),
-            )
-            .child(
-                div()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |_ui, _event, _cx| {
-                            unsafe { GLOBAL.assume_init_mut() }.end_recording()
-                        }),
-                    )
-                    .child("Save"),
+                list(self.list.clone())
+                    .w_full()
+                    .h_full()
+                    .p_3()
+                    .border_2()
+                    .border_color(white()),
             )
     }
 }
 
-fn virtual_key_to_unicode(keyboard: &[u8; 256], vk_code: VIRTUAL_KEY) -> char {
-    let mut unicode_buffer = [0u16; 2];
+impl Stroke {
+    fn char(&self) -> char {
+        let mut unicode_buffer = [0u16; 2];
 
-    unsafe {
-        ToUnicodeEx(
-            vk_code.0 as u32,
-            MapVirtualKeyW(vk_code.0 as u32, MAPVK_VK_TO_VSC),
-            keyboard,
-            &mut unicode_buffer,
-            0,
-            None,
-        )
-    };
+        unsafe {
+            ToUnicodeEx(
+                self.key.0 as u32,
+                MapVirtualKeyW(self.key.0 as u32, MAPVK_VK_TO_VSC),
+                &self.keyboard,
+                &mut unicode_buffer,
+                0,
+                None,
+            )
+        };
 
-    String::from_utf16(&unicode_buffer)
-        .unwrap()
-        .chars()
-        .next()
-        .unwrap()
+        String::from_utf16(&unicode_buffer)
+            .unwrap()
+            .chars()
+            .next()
+            .unwrap()
+    }
 }
