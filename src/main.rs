@@ -12,7 +12,6 @@ use windows::Win32::{
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 
-// todo?: use mutex
 static GLOBAL: LazyLock<Mutex<Global>> = LazyLock::new(|| Mutex::new(Global::new()));
 
 #[derive(Debug, Clone, IntoElement)]
@@ -24,39 +23,76 @@ pub struct Stroke {
 impl RenderOnce for Stroke {
     fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
         div()
-            .border_color(white())
-            .border_2()
             .text_color(white())
             .w_full()
             .h_full()
             .flex()
+            .gap_2()
             .justify_center()
             .items_center()
-            .rounded(px(3.0))
-            .child(format!("{}", self.char()))
+            .children(
+                self.keyboard
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|(_, v)| v & 0x80 != 0)
+                    .filter_map(|(idx, _)| Self::to_unicode(VIRTUAL_KEY(idx as u16)))
+                    .map(Key),
+            )
+            .child(Key(Self::to_unicode(self.key).unwrap_or(String::new())))
+            .child("| ")
+            .child(Key(
+                Self::to_unicode_with(self.key, &self.keyboard).unwrap_or(String::new())
+            ))
     }
 }
 
 impl Stroke {
-    fn char(&self) -> char {
+    fn to_unicode(key: VIRTUAL_KEY) -> Option<String> {
+        Self::to_unicode_with(key, &[0; 256])
+    }
+
+    fn to_unicode_with(key: VIRTUAL_KEY, keyboard: &[u8; 256]) -> Option<String> {
+        match key {
+            VK_LSHIFT | VK_RSHIFT => return None,
+            VK_LCONTROL | VK_RCONTROL => return None,
+            VK_LMENU | VK_RMENU => return None,
+            VK_SHIFT => return Some("Shift".into()),
+            VK_CONTROL => return Some("Control".into()),
+            VK_MENU => return Some("Menu".into()),
+            _ => {}
+        }
+
         let mut unicode_buffer = [0u16; 2];
 
         unsafe {
             ToUnicodeEx(
-                self.key.0 as u32,
-                MapVirtualKeyW(self.key.0 as u32, MAPVK_VK_TO_VSC),
-                &self.keyboard,
+                key.0 as u32,
+                MapVirtualKeyW(key.0 as u32, MAPVK_VK_TO_VSC),
+                keyboard,
                 &mut unicode_buffer,
                 0,
                 None,
             )
         };
 
-        String::from_utf16(&unicode_buffer)
-            .unwrap()
-            .chars()
-            .next()
-            .unwrap()
+        String::from_utf16(&unicode_buffer).ok()
+    }
+}
+
+#[derive(Debug, Clone, IntoElement)]
+pub struct Key(String);
+
+impl RenderOnce for Key {
+    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
+        div()
+            .bg(opaque_grey(0.1, 1.0))
+            .px_3()
+            .py_1()
+            .border_1()
+            .border_color(opaque_grey(0.4, 1.0))
+            .rounded(px(5.0))
+            .child(self.0)
     }
 }
 
@@ -294,19 +330,34 @@ extern "system" fn low_level_keyboard_proc(
         };
         drop(global);
         if let Some((stroke, state)) = stroke {
-            //let mut keyboard = Box::new([0u8; 256]);
-            //unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
-
-            //unsafe { SetKeyboardState(&stroke.keyboard) }.unwrap();
-
             send_key(&stroke, state);
-
-            //unsafe { SetKeyboardState(&keyboard) }.unwrap();
             return LRESULT(1);
         }
     }
 
     unsafe { CallNextHookEx(None, n_code, w_param, l_param) }
+}
+
+fn optional_stroke(
+    selected: bool,
+    facade: Model<Facade>,
+    stroke: Option<Stroke>,
+    event: impl Fn(&mut Facade, &mut ModelContext<Facade>) + 'static + Copy,
+) -> impl IntoElement {
+    div()
+        .w_full()
+        .min_h_24()
+        .when(selected, |div| div.bg(opaque_grey(0.2, 1.0)))
+        .on_mouse_down(MouseButton::Left, move |_, cx| {
+            cx.update_model(&facade, event)
+        })
+        .border_2()
+        .border_color(white())
+        .rounded(px(15.0))
+        .child(match stroke {
+            Some(stroke) => stroke.into_any_element(),
+            None => div().w_full().h_full().into_any_element(),
+        })
 }
 
 fn create_list_state(facade: Model<Facade>) -> ListState {
@@ -334,53 +385,19 @@ fn create_list_state(facade: Model<Facade>) -> ListState {
                 .w_full()
                 .gap_2()
                 .py_2()
-                .child(
-                    div()
-                        .w_full()
-                        .min_h_24()
-                        .when(idx == selected.0 && selected.1, |div| {
-                            div.bg(opaque_grey(0.2, 1.0))
-                        })
-                        .on_mouse_down(MouseButton::Left, move |_, cx| {
-                            cx.update_model(&facade_left, |_, cx| {
-                                cx.emit(GlobalSelect { idx, input: true })
-                            })
-                        })
-                        .child(match items[idx].input.clone() {
-                            Some(stroke) => stroke.into_any_element(),
-                            None => div()
-                                .border_2()
-                                .border_color(white())
-                                .rounded(px(5.0))
-                                .w_full()
-                                .h_full()
-                                .into_any_element(),
-                        }),
-                )
+                .child(optional_stroke(
+                    idx == selected.0 && selected.1,
+                    facade_left,
+                    items[idx].input.clone(),
+                    move |_, cx| cx.emit(GlobalSelect { idx, input: true }),
+                ))
                 .child(">")
-                .child(
-                    div()
-                        .w_full()
-                        .min_h_24()
-                        .when(idx == selected.0 && selected.1.not(), |div| {
-                            div.bg(opaque_grey(0.2, 1.0))
-                        })
-                        .on_mouse_down(MouseButton::Left, move |_, cx| {
-                            cx.update_model(&facade_right, |_, cx| {
-                                cx.emit(GlobalSelect { idx, input: false })
-                            })
-                        })
-                        .child(match items[idx].output.clone() {
-                            Some(stroke) => stroke.into_any_element(),
-                            None => div()
-                                .border_2()
-                                .border_color(white())
-                                .rounded(px(5.0))
-                                .w_full()
-                                .h_full()
-                                .into_any_element(),
-                        }),
-                )
+                .child(optional_stroke(
+                    idx == selected.0 && selected.1.not(),
+                    facade_right,
+                    items[idx].output.clone(),
+                    move |_, cx| cx.emit(GlobalSelect { idx, input: false }),
+                ))
                 .child("|")
                 .child(
                     div()
@@ -398,7 +415,7 @@ fn create_list_state(facade: Model<Facade>) -> ListState {
                         })
                         .border_2()
                         .border_color(white())
-                        .rounded(px(5.0))
+                        .rounded(px(15.0))
                         .child(if idx == selected.0 { "O" } else { "X" }),
                 )
                 .into_any_element()
@@ -447,7 +464,9 @@ fn main() {
                 let ui = ui.clone();
                 cx.subscribe(&facade, move |facade, _event: &GlobalChanged, cx| {
                     cx.update_view(&ui, |ui, cx| {
+                        let scroll = ui.list.logical_scroll_top();
                         ui.list = create_list_state(facade);
+                        ui.list.scroll_to(scroll);
                         cx.notify()
                     });
                 })
@@ -526,6 +545,7 @@ struct GlobalSelect {
     idx: usize,
     input: bool,
 }
+
 impl EventEmitter<GlobalSelect> for Facade {}
 
 impl gpui::Render for UI {
@@ -536,6 +556,7 @@ impl gpui::Render for UI {
             .flex_col()
             .w_full()
             .h_full()
+            .p_10()
             .child(
                 list(self.list.clone())
                     .w_full()

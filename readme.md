@@ -2,5 +2,6 @@
 
 ## todo
 
-- better ui
-- not print, all information in ui
+- cleanup
+- save and load
+- remove modifiers for output
