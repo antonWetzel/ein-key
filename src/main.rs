@@ -6,6 +6,7 @@ use std::{
 };
 
 use gpui::*;
+use prelude::FluentBuilder;
 use windows::Win32::{
     Foundation::*,
     UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
@@ -27,10 +28,35 @@ impl RenderOnce for Stroke {
             .border_2()
             .text_color(white())
             .w_full()
+            .h_full()
             .flex()
             .justify_center()
+            .items_center()
             .rounded(px(3.0))
             .child(format!("{}", self.char()))
+    }
+}
+
+impl Stroke {
+    fn char(&self) -> char {
+        let mut unicode_buffer = [0u16; 2];
+
+        unsafe {
+            ToUnicodeEx(
+                self.key.0 as u32,
+                MapVirtualKeyW(self.key.0 as u32, MAPVK_VK_TO_VSC),
+                &self.keyboard,
+                &mut unicode_buffer,
+                0,
+                None,
+            )
+        };
+
+        String::from_utf16(&unicode_buffer)
+            .unwrap()
+            .chars()
+            .next()
+            .unwrap()
     }
 }
 
@@ -40,74 +66,43 @@ pub struct Mapping {
     output: Option<Stroke>,
 }
 
+impl Mapping {
+    pub fn empty() -> Self {
+        Self {
+            input: None,
+            output: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Global {
-    action: Action,
+    selected: Option<(usize, bool)>,
     dirty: bool,
     keyboard: Box<[u8; 256]>,
 
     mappings: Vec<Mapping>,
 }
 
-#[derive(Debug)]
-pub enum Action {
-    Normal,
-    StartRecordIn,
-    RecordIn(Stroke),
-    StartRecordOut(Stroke),
-    RecordOut { input: Stroke, output: Stroke },
-}
-
 impl Global {
     pub fn new() -> Self {
         Self {
-            action: Action::Normal,
-            mappings: Vec::new(),
-            dirty: false,
+            selected: None,
+            mappings: vec![Mapping::empty()],
+            dirty: true,
             keyboard: Box::new([0; 256]),
         }
     }
 
-    pub fn start_recording_input(&mut self) {
-        println!("start recording input");
-        self.action = Action::StartRecordIn;
-    }
-
-    pub fn start_recording_output(&mut self) {
-        println!("start recording output");
-        self.action = match std::mem::replace(&mut self.action, Action::Normal) {
-            Action::RecordIn(stroke) => {
-                println!("In: {:?}", stroke.char());
-                Action::StartRecordOut(stroke)
-            }
-            action => action,
+    fn maybe_add_empty(&mut self) {
+        let add = match self.mappings.last() {
+            None => true,
+            Some(mapping) => mapping.input.is_some() || mapping.output.is_some(),
         };
-    }
-
-    pub fn end_recording(&mut self) {
-        println!("end recording");
-        self.action = match std::mem::replace(&mut self.action, Action::Normal) {
-            Action::RecordOut { input, output } => {
-                println!("Map: {:?} {:?}", input.char(), output.char());
-                for i in 0..256 {
-                    if input.keyboard[i] != 0 {
-                        println!("  In: {:?}", i);
-                    }
-                }
-                for i in 0..256 {
-                    if output.keyboard[i] != 0 {
-                        println!("  Out: {:?}", i);
-                    }
-                }
-                self.mappings.push(Mapping {
-                    input: Some(input),
-                    output: Some(output),
-                });
-                self.dirty = true;
-                Action::Normal
-            }
-            action => action,
-        };
+        if add.not() {
+            return;
+        }
+        self.mappings.push(Mapping::empty());
     }
 
     pub fn mapped_key(&self, key: VIRTUAL_KEY, state: KeyState) -> Status {
@@ -130,9 +125,6 @@ impl Global {
             if valid.not() {
                 continue;
             }
-
-            let mut keyboard = Box::new([0u8; 256]);
-            unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
 
             return match mapping.output.clone() {
                 Some(stroke) => Status::Replace { stroke, state },
@@ -162,34 +154,26 @@ impl Global {
             self.set_key(key, state);
         }
 
-        let (action, status) = match std::mem::replace(&mut self.action, Action::Normal) {
-            Action::Normal => (Action::Normal, self.mapped_key(key, state)),
-
-            Action::StartRecordIn | Action::RecordIn { .. } if state.pressed() => {
+        let status = match self.selected {
+            Some((index, input)) if state.pressed() => {
+                let target = match input {
+                    true => &mut self.mappings[index].input,
+                    false => &mut self.mappings[index].output,
+                };
+                *target = Some(Stroke {
+                    keyboard: self.keyboard.clone(),
+                    key,
+                });
                 self.dirty = true;
-                let keyboard = self.keyboard.clone();
-                let stroke = Stroke { key, keyboard };
-
-                println!("In: {:?}", stroke.char());
-
-                let action = Action::RecordIn(stroke);
-
-                (action, Status::Allow)
+                Status::Intercept
             }
-            Action::StartRecordOut(input) | Action::RecordOut { input, .. } if state.pressed() => {
-                self.dirty = true;
-                let keyboard = self.keyboard.clone();
-                let output = Stroke { key, keyboard };
-                println!("Out: {:?}", output.char());
-                let action = Action::RecordOut { input, output };
-                (action, Status::Allow)
-            }
-            action => (action, Status::Allow),
+            Some(_) => Status::Intercept,
+            None => self.mapped_key(key, state),
         };
+
         if state.pressed() {
             self.set_key(key, state);
         }
-        self.action = action;
         status
     }
 
@@ -199,7 +183,6 @@ impl Global {
             KeyState::Released => 0,
         };
         self.keyboard[key.0 as usize] = value;
-
         match key {
             VK_LSHIFT | VK_RSHIFT => self.combine_keys(VK_SHIFT, VK_LSHIFT, VK_RSHIFT),
             VK_LCONTROL | VK_RCONTROL => self.combine_keys(VK_CONTROL, VK_LCONTROL, VK_RCONTROL),
@@ -236,25 +219,58 @@ pub enum Status {
     Replace { stroke: Stroke, state: KeyState },
 }
 
-fn send_key(key: VIRTUAL_KEY, state: KeyState) {
-    let flags = match state {
-        KeyState::Pressed => KEYBD_EVENT_FLAGS(0),
-        KeyState::Released => KEYEVENTF_KEYUP,
-    };
+fn send_key(stroke: &Stroke, state: KeyState) {
+    let mut keyboard = Box::new([0u8; 256]);
+    unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
 
-    let input = INPUT {
+    let mut input = INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 {
             ki: KEYBDINPUT {
-                wVk: key,
+                wVk: VIRTUAL_KEY(0),
                 wScan: 0,
-                dwFlags: flags,
+                dwFlags: KEYBD_EVENT_FLAGS(0),
                 time: 0,
                 dwExtraInfo: 0,
             },
         },
     };
-    unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+
+    let mut inputs = Vec::new();
+    for (idx, value) in stroke.keyboard.iter().copied().enumerate() {
+        match VIRTUAL_KEY(idx as u16) {
+            VK_LSHIFT | VK_RSHIFT => continue,
+            VK_LCONTROL | VK_RCONTROL => continue,
+            VK_LMENU | VK_RMENU => continue,
+            _ => {}
+        }
+        if value & 0x80 != keyboard[idx] & 0x80 {
+            input.Anonymous.ki.dwFlags = if value & 0x80 != 0 {
+                KEYBD_EVENT_FLAGS(0)
+            } else {
+                KEYEVENTF_KEYUP
+            };
+            input.Anonymous.ki.wVk = VIRTUAL_KEY(idx as u16);
+            inputs.push(input);
+        }
+    }
+
+    input.Anonymous.ki.dwFlags = match state {
+        KeyState::Pressed => KEYBD_EVENT_FLAGS(0),
+        KeyState::Released => KEYEVENTF_KEYUP,
+    };
+    input.Anonymous.ki.wVk = stroke.key;
+    inputs.push(input);
+
+    for idx in (0..(inputs.len() / 2)).rev() {
+        let mut input = inputs[idx];
+        unsafe {
+            input.Anonymous.ki.dwFlags.0 ^= KEYEVENTF_KEYUP.0;
+        };
+        inputs.push(input);
+    }
+
+    unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
 }
 
 extern "system" fn low_level_keyboard_proc(
@@ -278,9 +294,14 @@ extern "system" fn low_level_keyboard_proc(
         };
         drop(global);
         if let Some((stroke, state)) = stroke {
-            unsafe { SetKeyboardState(&stroke.keyboard) }.unwrap();
-            send_key(stroke.key, state);
-            unsafe { SetKeyboardState(&stroke.keyboard) }.unwrap();
+            //let mut keyboard = Box::new([0u8; 256]);
+            //unsafe { GetKeyboardState(&mut keyboard) }.unwrap();
+
+            //unsafe { SetKeyboardState(&stroke.keyboard) }.unwrap();
+
+            send_key(&stroke, state);
+
+            //unsafe { SetKeyboardState(&keyboard) }.unwrap();
             return LRESULT(1);
         }
     }
@@ -289,42 +310,96 @@ extern "system" fn low_level_keyboard_proc(
 }
 
 fn create_list_state(facade: Model<Facade>) -> ListState {
-    let items = GLOBAL.lock().unwrap().mappings.clone();
+    let global = GLOBAL.lock().unwrap();
+    let items = global.mappings.clone();
+    let selected = match global.selected {
+        Some((idx, input)) => (idx, input),
+        None => (usize::MAX, true),
+    };
+    drop(global);
 
     ListState::new(
         items.len(),
         ListAlignment::Top,
         px(20.0),
         move |idx, _cx| {
-            let facade = facade.clone();
+            let facade_left = facade.clone();
+            let facade_right = facade.clone();
+            let facade_del = facade.clone();
             div()
                 .flex()
                 .flex_row()
+                .justify_center()
+                .items_center()
                 .w_full()
                 .gap_2()
                 .py_2()
-                .child(match items[idx].input.clone() {
-                    Some(stroke) => stroke.into_any_element(),
-                    None => div().into_any_element(),
-                })
+                .child(
+                    div()
+                        .w_full()
+                        .min_h_24()
+                        .when(idx == selected.0 && selected.1, |div| {
+                            div.bg(opaque_grey(0.2, 1.0))
+                        })
+                        .on_mouse_down(MouseButton::Left, move |_, cx| {
+                            cx.update_model(&facade_left, |_, cx| {
+                                cx.emit(GlobalSelect { idx, input: true })
+                            })
+                        })
+                        .child(match items[idx].input.clone() {
+                            Some(stroke) => stroke.into_any_element(),
+                            None => div()
+                                .border_2()
+                                .border_color(white())
+                                .rounded(px(5.0))
+                                .w_full()
+                                .h_full()
+                                .into_any_element(),
+                        }),
+                )
                 .child(">")
-                .child(match items[idx].output.clone() {
-                    Some(stroke) => stroke.into_any_element(),
-                    None => div().into_any_element(),
-                })
+                .child(
+                    div()
+                        .w_full()
+                        .min_h_24()
+                        .when(idx == selected.0 && selected.1.not(), |div| {
+                            div.bg(opaque_grey(0.2, 1.0))
+                        })
+                        .on_mouse_down(MouseButton::Left, move |_, cx| {
+                            cx.update_model(&facade_right, |_, cx| {
+                                cx.emit(GlobalSelect { idx, input: false })
+                            })
+                        })
+                        .child(match items[idx].output.clone() {
+                            Some(stroke) => stroke.into_any_element(),
+                            None => div()
+                                .border_2()
+                                .border_color(white())
+                                .rounded(px(5.0))
+                                .w_full()
+                                .h_full()
+                                .into_any_element(),
+                        }),
+                )
                 .child("|")
                 .child(
                     div()
+                        .flex()
+                        .justify_center()
+                        .items_center()
+                        .min_w_24()
+                        .min_h_24()
                         .on_mouse_down(MouseButton::Left, move |_, cx| {
-                            cx.update_model(&facade, |_, cx| cx.emit(GlobalDelete(idx)))
+                            if idx == selected.0 {
+                                cx.update_model(&facade_del, |_, cx| cx.emit(GlobalExitEdit))
+                            } else {
+                                cx.update_model(&facade_del, |_, cx| cx.emit(GlobalDelete(idx)))
+                            }
                         })
                         .border_2()
                         .border_color(white())
                         .rounded(px(5.0))
-                        .w_20()
-                        .flex()
-                        .justify_center()
-                        .child("X"),
+                        .child(if idx == selected.0 { "O" } else { "X" }),
                 )
                 .into_any_element()
         },
@@ -382,12 +457,39 @@ fn main() {
             {
                 cx.subscribe(&facade, move |_facade, event: &GlobalDelete, _cx| {
                     let mut global = GLOBAL.lock().unwrap();
+                    if global.selected.is_some() {
+                        return;
+                    }
                     if event.0 >= global.mappings.len() {
                         println!("Remove out of bounds of mappings, how?");
                         return;
                     }
-                    global.mappings.swap_remove(event.0);
+                    global.mappings.remove(event.0);
                     global.dirty = true;
+                    global.maybe_add_empty();
+                })
+                .detach();
+            }
+
+            {
+                cx.subscribe(&facade, move |_facade, event: &GlobalSelect, _cx| {
+                    let mut global = GLOBAL.lock().unwrap();
+                    global.selected = Some((event.idx, event.input));
+                    match event.input {
+                        true => global.mappings[event.idx].input = None,
+                        false => global.mappings[event.idx].output = None,
+                    };
+                    global.dirty = true;
+                })
+                .detach();
+            }
+
+            {
+                cx.subscribe(&facade, move |_facade, event: &GlobalExitEdit, _cx| {
+                    let mut global = GLOBAL.lock().unwrap();
+                    global.selected = None;
+                    global.dirty = true;
+                    global.maybe_add_empty();
                 })
                 .detach();
             }
@@ -417,6 +519,15 @@ impl EventEmitter<GlobalChanged> for Facade {}
 struct GlobalDelete(usize);
 impl EventEmitter<GlobalDelete> for Facade {}
 
+struct GlobalExitEdit;
+impl EventEmitter<GlobalExitEdit> for Facade {}
+
+struct GlobalSelect {
+    idx: usize,
+    input: bool,
+}
+impl EventEmitter<GlobalSelect> for Facade {}
+
 impl gpui::Render for UI {
     fn render(&mut self, cx: &mut gpui::ViewContext<Self>) -> impl gpui::IntoElement {
         div()
@@ -426,42 +537,6 @@ impl gpui::Render for UI {
             .w_full()
             .h_full()
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_5()
-                    .child(
-                        div()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |_ui, _event, _cx| {
-                                    GLOBAL.lock().unwrap().start_recording_input();
-                                }),
-                            )
-                            .child("Input"),
-                    )
-                    .child(
-                        div()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |_ui, _event, _cx| {
-                                    GLOBAL.lock().unwrap().start_recording_output();
-                                }),
-                            )
-                            .child("Output"),
-                    )
-                    .child(
-                        div()
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |_ui, _event, _cx| {
-                                    GLOBAL.lock().unwrap().end_recording();
-                                }),
-                            )
-                            .child("Save"),
-                    ),
-            )
-            .child(
                 list(self.list.clone())
                     .w_full()
                     .h_full()
@@ -469,28 +544,5 @@ impl gpui::Render for UI {
                     .border_2()
                     .border_color(white()),
             )
-    }
-}
-
-impl Stroke {
-    fn char(&self) -> char {
-        let mut unicode_buffer = [0u16; 2];
-
-        unsafe {
-            ToUnicodeEx(
-                self.key.0 as u32,
-                MapVirtualKeyW(self.key.0 as u32, MAPVK_VK_TO_VSC),
-                &self.keyboard,
-                &mut unicode_buffer,
-                0,
-                None,
-            )
-        };
-
-        String::from_utf16(&unicode_buffer)
-            .unwrap()
-            .chars()
-            .next()
-            .unwrap()
     }
 }
