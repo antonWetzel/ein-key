@@ -9,6 +9,8 @@ pub struct Stroke {
     key: VIRTUAL_KEY,
 }
 
+pub const SET_BIT: u8 = 0x80;
+
 impl RenderOnce for Stroke {
     fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
         div()
@@ -24,7 +26,7 @@ impl RenderOnce for Stroke {
                     .iter()
                     .copied()
                     .enumerate()
-                    .filter(|(_, v)| v & 0x80 != 0)
+                    .filter(|(_, v)| v & SET_BIT != 0)
                     .filter_map(|(idx, _)| Self::to_unicode(VIRTUAL_KEY(idx as u16)))
                     .map(Key),
             )
@@ -81,6 +83,40 @@ impl Stroke {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct StrokeData {
+    key: u16,
+    keyboard: Vec<u8>,
+}
+
+impl From<StrokeData> for Stroke {
+    fn from(stroke_data: StrokeData) -> Self {
+        let mut keyboard = Box::new([0; 256]);
+        for idx in stroke_data.keyboard {
+            keyboard[idx as usize] = SET_BIT;
+        }
+        Self {
+            key: VIRTUAL_KEY(stroke_data.key),
+            keyboard,
+        }
+    }
+}
+
+impl From<Stroke> for StrokeData {
+    fn from(stroke: Stroke) -> Self {
+        Self {
+            key: stroke.key.0,
+            keyboard: stroke
+                .keyboard
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(_, v)| (v & SET_BIT != 0).then_some(v as u8))
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, IntoElement)]
 pub struct Key(String);
 
@@ -97,6 +133,12 @@ impl RenderOnce for Key {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Input,
+    Output,
+}
+
 #[derive(Debug, Clone)]
 pub struct Mapping {
     input: Option<Stroke>,
@@ -111,10 +153,10 @@ impl Mapping {
         }
     }
 
-    pub fn clear(&mut self, input: bool) {
-        match input {
-            true => self.input = None,
-            false => self.output = None,
+    pub fn clear(&mut self, side: Side) {
+        match side {
+            Side::Input => self.input = None,
+            Side::Output => self.output = None,
         }
     }
 
@@ -122,12 +164,7 @@ impl Mapping {
         self.input.is_none() && self.output.is_none()
     }
 
-    pub fn status(
-        &self,
-        keyboard: &[u8; 256],
-        key: VIRTUAL_KEY,
-        state: KeyState,
-    ) -> Option<Status> {
+    pub fn status(&self, keyboard: &[u8; 256], key: VIRTUAL_KEY) -> Option<Option<Stroke>> {
         let Some(input) = &self.input else {
             return None;
         };
@@ -141,31 +178,51 @@ impl Mapping {
             .iter()
             .copied()
             .zip(keyboard.iter().copied())
-            .all(|(target, current)| current & 0x80 != 0 || target & 0x80 == 0);
+            .all(|(target, current)| current & SET_BIT != 0 || target & SET_BIT == 0);
 
         if valid.not() {
             return None;
         }
 
-        let status = match self.output.clone() {
-            Some(stroke) => Status::Replace { stroke, state },
-            None => Status::Intercept,
-        };
-        Some(status)
+        Some(self.output.clone())
     }
 
-    pub fn update(&mut self, input: bool, keyboard: Box<[u8; 256]>, key: VIRTUAL_KEY) {
-        let target = match input {
-            true => &mut self.input,
-            false => &mut self.output,
+    pub fn update(&mut self, side: Side, keyboard: Box<[u8; 256]>, key: VIRTUAL_KEY) {
+        let target = match side {
+            Side::Input => &mut self.input,
+            Side::Output => &mut self.output,
         };
         *target = Some(Stroke::new(keyboard, key));
     }
 
-    pub fn get(&self, input: bool) -> Option<&Stroke> {
-        match input {
-            true => self.input.as_ref(),
-            false => self.output.as_ref(),
+    pub fn get(&self, side: Side) -> Option<&Stroke> {
+        match side {
+            Side::Input => self.input.as_ref(),
+            Side::Output => self.output.as_ref(),
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct MappingData {
+    input: Option<StrokeData>,
+    output: Option<StrokeData>,
+}
+
+impl From<MappingData> for Mapping {
+    fn from(mapping_data: MappingData) -> Self {
+        Self {
+            input: mapping_data.input.map(Into::into),
+            output: mapping_data.output.map(Into::into),
+        }
+    }
+}
+
+impl From<Mapping> for MappingData {
+    fn from(mapping: Mapping) -> Self {
+        Self {
+            input: mapping.input.map(Into::into),
+            output: mapping.output.map(Into::into),
         }
     }
 }
@@ -189,5 +246,5 @@ impl KeyState {
 pub enum Status {
     Intercept,
     Allow,
-    Replace { stroke: Stroke, state: KeyState },
+    Replace(Vec<INPUT>),
 }

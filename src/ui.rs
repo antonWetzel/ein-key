@@ -1,4 +1,4 @@
-use std::ops::Not;
+use std::{ops::Not, path::PathBuf};
 
 use gpui::*;
 use prelude::FluentBuilder;
@@ -8,13 +8,19 @@ use crate::{
         Global, GlobalChanged, GlobalCheck, GlobalChecker, GlobalDelete, GlobalExitEdit,
         GlobalSelect,
     },
-    keys::Stroke,
+    keys::{Side, Stroke},
 };
 
 pub struct UI {
     _global_checker: Model<GlobalChecker>,
     list: ListState,
 }
+
+pub struct Import(PathBuf);
+impl EventEmitter<Import> for UI {}
+
+pub struct Export(PathBuf);
+impl EventEmitter<Export> for UI {}
 
 impl UI {
     pub fn new(cx: &mut WindowContext) -> View<Self> {
@@ -71,7 +77,7 @@ impl UI {
         .detach();
 
         cx.subscribe(&global_checker, move |_, event: &GlobalSelect, _cx| {
-            Global::select(event.idx, event.input);
+            Global::select(event.idx, event.side);
         })
         .detach();
 
@@ -80,12 +86,62 @@ impl UI {
         })
         .detach();
 
+        cx.subscribe(&ui, move |_, event: &Import, _cx| {
+            Global::import(event.0.clone())
+        })
+        .detach();
+
+        cx.subscribe(&ui, move |_, event: &Export, _cx| {
+            Global::export(event.0.clone())
+        })
+        .detach();
+
         ui
     }
 }
 
-impl gpui::Render for UI {
-    fn render(&mut self, _cx: &mut gpui::ViewContext<Self>) -> impl gpui::IntoElement {
+fn open_file<T, E>(cx: &ViewContext<T>, event: impl Fn(PathBuf) -> E + 'static)
+where
+    T: EventEmitter<E>,
+    E: 'static,
+{
+    let channel = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+    });
+    cx.spawn(move |model, mut cx| async move {
+        let mut paths = match channel.await {
+            Ok(Ok(Some(paths))) => paths,
+            _ => return,
+        };
+        assert_eq!(paths.len(), 1);
+        let path = paths.pop().unwrap();
+        model.update(&mut cx, |_, cx| cx.emit(event(path))).unwrap();
+    })
+    .detach();
+}
+
+fn save_file<T, E>(cx: &ViewContext<T>, event: impl Fn(PathBuf) -> E + 'static)
+where
+    T: EventEmitter<E>,
+    E: 'static,
+{
+    let channel = cx.prompt_for_new_path(&Global::current_path());
+    cx.spawn(move |model, mut cx| async move {
+        let path = match channel.await {
+            Ok(Ok(Some(paths))) => paths,
+            _ => return,
+        };
+        model.update(&mut cx, |_, cx| cx.emit(event(path))).unwrap();
+    })
+    .detach();
+}
+
+impl Render for UI {
+    fn render(&mut self, cx: &mut gpui::ViewContext<Self>) -> impl gpui::IntoElement {
+        let selected = Global::mapping_selected();
+
         div()
             .text_color(white())
             .flex()
@@ -93,6 +149,22 @@ impl gpui::Render for UI {
             .w_full()
             .h_full()
             .p_10()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_3()
+                    .child(button(
+                        "Import",
+                        selected.not(),
+                        cx.listener(|_, _, cx| open_file(cx, Import)),
+                    ))
+                    .child(button(
+                        "Export",
+                        selected.not(),
+                        cx.listener(|_, _, cx| save_file(cx, Export)),
+                    )),
+            )
             .child(
                 list(self.list.clone())
                     .w_full()
@@ -102,6 +174,27 @@ impl gpui::Render for UI {
                     .border_color(white()),
             )
     }
+}
+
+pub fn button(
+    text: &'static str,
+    active: bool,
+    event: impl Fn(&MouseDownEvent, &mut WindowContext) + 'static,
+) -> impl IntoElement {
+    div()
+        .border_2()
+        .rounded(px(15.0))
+        .px_3()
+        .py_1()
+        .when(active, |div| {
+            div.on_mouse_down(MouseButton::Left, event)
+                .border_color(white())
+        })
+        .when(active.not(), |div| {
+            div.text_color(opaque_grey(0.2, 1.0))
+                .border_color(opaque_grey(0.2, 1.0))
+        })
+        .child(text)
 }
 
 fn optional_stroke(
@@ -135,6 +228,7 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
         px(20.0),
         move |idx, _cx| {
             let global_checker_del = global_checker.clone();
+            let active = selected.0 == usize::MAX || idx == selected.0;
             div()
                 .flex()
                 .flex_row()
@@ -144,17 +238,27 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                 .gap_2()
                 .py_2()
                 .child(optional_stroke(
-                    idx == selected.0 && selected.1,
+                    idx == selected.0 && selected.1 == Side::Input,
                     global_checker.clone(),
-                    items[idx].get(true).cloned(),
-                    move |_, cx| cx.emit(GlobalSelect { idx, input: true }),
+                    items[idx].get(Side::Input).cloned(),
+                    move |_, cx| {
+                        cx.emit(GlobalSelect {
+                            idx,
+                            side: Side::Input,
+                        })
+                    },
                 ))
                 .child(">")
                 .child(optional_stroke(
-                    idx == selected.0 && selected.1.not(),
+                    idx == selected.0 && selected.1 == Side::Output,
                     global_checker.clone(),
-                    items[idx].get(false).cloned(),
-                    move |_, cx| cx.emit(GlobalSelect { idx, input: false }),
+                    items[idx].get(Side::Output).cloned(),
+                    move |_, cx| {
+                        cx.emit(GlobalSelect {
+                            idx,
+                            side: Side::Output,
+                        })
+                    },
                 ))
                 .child("|")
                 .child(
@@ -176,7 +280,8 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                             }
                         })
                         .border_2()
-                        .border_color(white())
+                        .when(active, |div| div.border_color(white()))
+                        .when(active.not(), |div| div.border_color(opaque_grey(0.2, 1.0)))
                         .rounded(px(15.0))
                         .child(if idx == selected.0 { "O" } else { "X" }),
                 )

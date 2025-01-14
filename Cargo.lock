@@ -1192,6 +1192,8 @@ name = "ein-key"
 version = "0.1.0"
 dependencies = [
  "gpui",
+ "serde",
+ "serde_json",
  "windows 0.59.0",
 ]
 

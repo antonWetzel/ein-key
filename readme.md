@@ -2,6 +2,5 @@
 
 ## todo
 
-- cleanup
-- save and load
-- remove modifiers for output
+- global color definitions
+	- make pretty
