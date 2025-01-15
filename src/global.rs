@@ -257,17 +257,6 @@ impl Global {
             KeyState::Released => 0,
         };
         self.keyboard[key.0 as usize] = value;
-        match key {
-            VK_LSHIFT | VK_RSHIFT => self.combine_keys(VK_SHIFT, VK_LSHIFT, VK_RSHIFT),
-            VK_LCONTROL | VK_RCONTROL => self.combine_keys(VK_CONTROL, VK_LCONTROL, VK_RCONTROL),
-            VK_LMENU | VK_RMENU => self.combine_keys(VK_MENU, VK_LMENU, VK_RMENU),
-            _ => {}
-        }
-    }
-
-    fn combine_keys(&mut self, target: VIRTUAL_KEY, left: VIRTUAL_KEY, right: VIRTUAL_KEY) {
-        self.keyboard[target.0 as usize] =
-            self.keyboard[left.0 as usize] | self.keyboard[right.0 as usize]
     }
 }
 

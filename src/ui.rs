@@ -9,6 +9,8 @@ use crate::{
         GlobalSelect,
     },
     keys::{Side, Stroke},
+    theme::Color,
+    title_bar::WindowsWindowControls,
 };
 
 pub struct UI {
@@ -142,63 +144,125 @@ impl Render for UI {
     fn render(&mut self, cx: &mut gpui::ViewContext<Self>) -> impl gpui::IntoElement {
         let selected = Global::mapping_selected();
 
+        let menu_interactivity = match selected {
+            false => Interactivity::Normal,
+            true => Interactivity::Disabled,
+        };
+
         div()
-            .text_color(white())
             .flex()
             .flex_col()
             .w_full()
             .h_full()
-            .p_10()
+            .bg(Color::Background)
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap_3()
-                    .child(button(
-                        "Import",
-                        selected.not(),
-                        cx.listener(|_, _, cx| open_file(cx, Import)),
-                    ))
-                    .child(button(
-                        "Export",
-                        selected.not(),
-                        cx.listener(|_, _, cx| save_file(cx, Export)),
-                    )),
+                    .items_center()
+                    .content_center()
+                    .bg(Color::BackgroundHover)
+                    .text_color(Color::Foreground)
+                    .child(div().w_4())
+                    .child(div().child("Ein-Key"))
+                    .child(div().w_10())
+                    .child(
+                        div()
+                            .when(menu_interactivity.normal(), |div| {
+                                div.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, cx| save_file(cx, Export)),
+                                )
+                            })
+                            .when(menu_interactivity.normal().not(), |div| {
+                                div.text_color(Color::ForegroundDisabled)
+                            })
+                            .px_3()
+                            .child("Export"),
+                    )
+                    .child(
+                        div()
+                            .when(menu_interactivity.normal(), |div| {
+                                div.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, cx| open_file(cx, Import)),
+                                )
+                            })
+                            .when(menu_interactivity.normal().not(), |div| {
+                                div.text_color(Color::ForegroundDisabled)
+                            })
+                            .px_3()
+                            .child("Import"),
+                    )
+                    .child(div().flex_1())
+                    .child(WindowsWindowControls::new()),
             )
             .child(
-                list(self.list.clone())
+                div()
                     .w_full()
                     .h_full()
-                    .p_3()
-                    .border_2()
-                    .border_color(white()),
+                    .px_10()
+                    .child(list(self.list.clone()).w_full().h_full()),
             )
     }
 }
 
-pub fn button(
-    text: &'static str,
-    active: bool,
-    event: impl Fn(&MouseDownEvent, &mut WindowContext) + 'static,
-) -> impl IntoElement {
-    div()
-        .border_2()
-        .rounded(px(15.0))
-        .px_3()
-        .py_1()
-        .when(active, |div| {
-            div.on_mouse_down(MouseButton::Left, event)
-                .border_color(white())
-        })
-        .when(active.not(), |div| {
-            div.text_color(opaque_grey(0.2, 1.0))
-                .border_color(opaque_grey(0.2, 1.0))
-        })
-        .child(text)
+#[derive(Debug, Clone, Copy)]
+pub enum Interactivity {
+    Disabled,
+    Normal,
+    Selected,
+}
+
+impl Interactivity {
+    pub fn stroke(selected: (usize, Side), idx: usize, side: Side) -> Self {
+        if selected.0 == usize::MAX {
+            return Self::Normal;
+        }
+
+        if selected == (idx, side) {
+            return Self::Selected;
+        }
+        if selected.0 == idx {
+            return Self::Normal;
+        }
+
+        Self::Disabled
+    }
+
+    pub fn close(selected: (usize, Side), idx: usize) -> Self {
+        if selected.0 == usize::MAX || selected.0 == idx {
+            return Self::Normal;
+        }
+        Self::Disabled
+    }
+
+    pub fn normal(self) -> bool {
+        match self {
+            Self::Normal => true,
+            _ => false,
+        }
+    }
+
+    pub fn background(self) -> Color {
+        match self {
+            Self::Normal => Color::Background,
+            Self::Disabled => Color::BackgroundDisabled,
+            Self::Selected => Color::BackgroundSelected,
+        }
+    }
+
+    pub fn foreground(self) -> Color {
+        match self {
+            Self::Normal => Color::Foreground,
+            Self::Disabled => Color::ForegroundDisabled,
+            Self::Selected => Color::ForegroundSelected,
+        }
+    }
 }
 
 fn optional_stroke(
-    selected: bool,
+    interactivity: Interactivity,
     global_checker: Model<GlobalChecker>,
     stroke: Option<Stroke>,
     event: impl Fn(&mut GlobalChecker, &mut ModelContext<GlobalChecker>) + 'static + Copy,
@@ -206,15 +270,19 @@ fn optional_stroke(
     div()
         .w_full()
         .min_h_24()
-        .when(selected, |div| div.bg(opaque_grey(0.2, 1.0)))
+        .bg(interactivity.background())
+        .when(interactivity.normal(), |div| {
+            div.hover(|div| div.bg(Color::BackgroundSelected))
+        })
+        .text_color(interactivity.foreground())
+        .border_color(interactivity.foreground())
         .on_mouse_down(MouseButton::Left, move |_, cx| {
             cx.update_model(&global_checker, event)
         })
         .border_2()
-        .border_color(white())
         .rounded(px(15.0))
         .child(match stroke {
-            Some(stroke) => stroke.into_any_element(),
+            Some(stroke) => stroke.render(interactivity).into_any_element(),
             None => div().w_full().h_full().into_any_element(),
         })
 }
@@ -228,7 +296,7 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
         px(20.0),
         move |idx, _cx| {
             let global_checker_del = global_checker.clone();
-            let active = selected.0 == usize::MAX || idx == selected.0;
+            let interactivity = Interactivity::close(selected, idx);
             div()
                 .flex()
                 .flex_row()
@@ -237,8 +305,9 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                 .w_full()
                 .gap_2()
                 .py_2()
+                .text_color(interactivity.foreground())
                 .child(optional_stroke(
-                    idx == selected.0 && selected.1 == Side::Input,
+                    Interactivity::stroke(selected, idx, Side::Input),
                     global_checker.clone(),
                     items[idx].get(Side::Input).cloned(),
                     move |_, cx| {
@@ -248,9 +317,15 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                         })
                     },
                 ))
-                .child(">")
+                .child(
+                    svg()
+                        .path("chevron-right.svg")
+                        .min_w_10()
+                        .min_h_10()
+                        .text_color(interactivity.foreground()),
+                )
                 .child(optional_stroke(
-                    idx == selected.0 && selected.1 == Side::Output,
+                    Interactivity::stroke(selected, idx, Side::Output),
                     global_checker.clone(),
                     items[idx].get(Side::Output).cloned(),
                     move |_, cx| {
@@ -260,7 +335,6 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                         })
                     },
                 ))
-                .child("|")
                 .child(
                     div()
                         .flex()
@@ -268,6 +342,14 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                         .items_center()
                         .min_w_24()
                         .min_h_24()
+                        .bg(interactivity.background())
+                        .border_2()
+                        .rounded(px(15.0))
+                        .border_color(interactivity.foreground())
+                        .text_color(interactivity.foreground())
+                        .when(interactivity.normal(), |div| {
+                            div.hover(|div| div.bg(Color::BackgroundHover))
+                        })
                         .on_mouse_down(MouseButton::Left, move |_, cx| {
                             if idx == selected.0 {
                                 cx.update_model(&global_checker_del, |_, cx| {
@@ -279,11 +361,17 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                                 })
                             }
                         })
-                        .border_2()
-                        .when(active, |div| div.border_color(white()))
-                        .when(active.not(), |div| div.border_color(opaque_grey(0.2, 1.0)))
-                        .rounded(px(15.0))
-                        .child(if idx == selected.0 { "O" } else { "X" }),
+                        .child(
+                            svg()
+                                .path(if idx == selected.0 {
+                                    "check.svg"
+                                } else {
+                                    "x.svg"
+                                })
+                                .text_color(interactivity.foreground())
+                                .min_w_10()
+                                .min_h_10(),
+                        ),
                 )
                 .into_any_element()
         },

@@ -1,9 +1,12 @@
 use std::ops::Not;
 
 use gpui::*;
+use prelude::FluentBuilder;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
-#[derive(Debug, Clone, IntoElement)]
+use crate::{ui::Interactivity, vk_table::VirtualKeyExtension};
+
+#[derive(Debug, Clone)]
 pub struct Stroke {
     keyboard: Box<[u8; 256]>,
     key: VIRTUAL_KEY,
@@ -11,30 +14,40 @@ pub struct Stroke {
 
 pub const SET_BIT: u8 = 0x80;
 
-impl RenderOnce for Stroke {
-    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
+impl Stroke {
+    pub fn render(&self, interactivity: Interactivity) -> impl IntoElement {
+        let mut modifier = false;
         div()
-            .text_color(white())
             .w_full()
             .h_full()
             .flex()
             .gap_2()
             .justify_center()
             .items_center()
+            .text_color(interactivity.foreground())
             .children(
                 self.keyboard
                     .iter()
                     .copied()
                     .enumerate()
                     .filter(|(_, v)| v & SET_BIT != 0)
-                    .filter_map(|(idx, _)| Self::to_unicode(VIRTUAL_KEY(idx as u16)))
-                    .map(Key),
+                    .map(|(idx, _)| VIRTUAL_KEY(idx as u16).name().into())
+                    .map(|text| render_key(text, interactivity))
+                    .map(|v| {
+                        modifier = true;
+                        v
+                    }),
             )
-            .child(Key(Self::to_unicode(self.key).unwrap_or(String::new())))
-            .child("| ")
-            .child(Key(
-                Self::to_unicode_with(self.key, &self.keyboard).unwrap_or(String::new())
-            ))
+            .when(modifier, |div| {
+                div.child(
+                    svg()
+                        .path("plus.svg")
+                        .min_w_6()
+                        .min_h_6()
+                        .text_color(interactivity.foreground()),
+                )
+            })
+            .child(render_key(self.key.name().into(), interactivity))
     }
 }
 
@@ -49,37 +62,6 @@ impl Stroke {
 
     pub fn keyboard(&self) -> &[u8; 256] {
         &self.keyboard
-    }
-
-    fn to_unicode(key: VIRTUAL_KEY) -> Option<String> {
-        Self::to_unicode_with(key, &[0; 256])
-    }
-
-    fn to_unicode_with(key: VIRTUAL_KEY, keyboard: &[u8; 256]) -> Option<String> {
-        match key {
-            VK_LSHIFT | VK_RSHIFT => return None,
-            VK_LCONTROL | VK_RCONTROL => return None,
-            VK_LMENU | VK_RMENU => return None,
-            VK_SHIFT => return Some("Shift".into()),
-            VK_CONTROL => return Some("Control".into()),
-            VK_MENU => return Some("Menu".into()),
-            _ => {}
-        }
-
-        let mut unicode_buffer = [0u16; 2];
-
-        unsafe {
-            ToUnicodeEx(
-                key.0 as u32,
-                MapVirtualKeyW(key.0 as u32, MAPVK_VK_TO_VSC),
-                keyboard,
-                &mut unicode_buffer,
-                0,
-                None,
-            )
-        };
-
-        String::from_utf16(&unicode_buffer).ok()
     }
 }
 
@@ -117,20 +99,15 @@ impl From<Stroke> for StrokeData {
     }
 }
 
-#[derive(Debug, Clone, IntoElement)]
-pub struct Key(String);
-
-impl RenderOnce for Key {
-    fn render(self, _cx: &mut WindowContext) -> impl IntoElement {
-        div()
-            .bg(opaque_grey(0.1, 1.0))
-            .px_3()
-            .py_1()
-            .border_1()
-            .border_color(opaque_grey(0.4, 1.0))
-            .rounded(px(5.0))
-            .child(self.0)
-    }
+fn render_key(text: String, interactivity: Interactivity) -> impl IntoElement {
+    div()
+        .px_3()
+        .py_1()
+        .border_1()
+        .rounded(px(10.0))
+        .bg(interactivity.background())
+        .border_color(interactivity.foreground())
+        .child(text)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
