@@ -2,11 +2,6 @@
 
 Simple Key-Remapper for Windows
 
-## Todo
-
-- cleanup again
-- make public
-
 ## Usage
 
 - Create or edit remapping
