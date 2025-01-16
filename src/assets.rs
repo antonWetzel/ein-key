@@ -13,15 +13,7 @@ macro_rules! create_match {
 
 impl AssetSource for BundledAssets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        create_match!(
-            path,
-            "check.svg",
-            "chevron-right.svg",
-            "minus.svg",
-            "plus.svg",
-            "square.svg",
-            "x.svg"
-        )
+        create_match!(path, "check.svg", "chevron-right.svg", "plus.svg", "x.svg")
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {

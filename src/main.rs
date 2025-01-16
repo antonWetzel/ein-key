@@ -17,15 +17,17 @@ fn main() {
     let hook = Global::install_hook();
 
     App::new().with_assets(BundledAssets).run(|cx| {
-        let mut options = WindowOptions::default();
-        options.show = true;
-        options.titlebar = Some(TitlebarOptions {
-            title: None,
-            appears_transparent: true,
-            traffic_light_position: None,
-        });
-        options.focus = true;
-        cx.open_window(options, |cx| UI::new(cx)).unwrap();
+        let options = WindowOptions {
+            show: true,
+            focus: true,
+            titlebar: Some(TitlebarOptions {
+                title: None,
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            ..Default::default()
+        };
+        cx.open_window(options, UI::new).unwrap();
     });
 
     Global::delete_hook(hook);

@@ -1,4 +1,4 @@
-use std::{ops::Not, path::PathBuf};
+use std::path::PathBuf;
 
 use gpui::*;
 use prelude::FluentBuilder;
@@ -10,7 +10,7 @@ use crate::{
     },
     keys::{Side, Stroke},
     theme::Color,
-    title_bar::WindowsWindowControls,
+    title_bar::render_title_bar,
 };
 
 pub struct UI {
@@ -18,10 +18,10 @@ pub struct UI {
     list: ListState,
 }
 
-pub struct Import(PathBuf);
+pub struct Import(pub PathBuf);
 impl EventEmitter<Import> for UI {}
 
-pub struct Export(PathBuf);
+pub struct Export(pub PathBuf);
 impl EventEmitter<Export> for UI {}
 
 impl UI {
@@ -102,44 +102,6 @@ impl UI {
     }
 }
 
-fn open_file<T, E>(cx: &ViewContext<T>, event: impl Fn(PathBuf) -> E + 'static)
-where
-    T: EventEmitter<E>,
-    E: 'static,
-{
-    let channel = cx.prompt_for_paths(PathPromptOptions {
-        files: true,
-        directories: false,
-        multiple: false,
-    });
-    cx.spawn(move |model, mut cx| async move {
-        let mut paths = match channel.await {
-            Ok(Ok(Some(paths))) => paths,
-            _ => return,
-        };
-        assert_eq!(paths.len(), 1);
-        let path = paths.pop().unwrap();
-        model.update(&mut cx, |_, cx| cx.emit(event(path))).unwrap();
-    })
-    .detach();
-}
-
-fn save_file<T, E>(cx: &ViewContext<T>, event: impl Fn(PathBuf) -> E + 'static)
-where
-    T: EventEmitter<E>,
-    E: 'static,
-{
-    let channel = cx.prompt_for_new_path(&Global::current_path());
-    cx.spawn(move |model, mut cx| async move {
-        let path = match channel.await {
-            Ok(Ok(Some(paths))) => paths,
-            _ => return,
-        };
-        model.update(&mut cx, |_, cx| cx.emit(event(path))).unwrap();
-    })
-    .detach();
-}
-
 impl Render for UI {
     fn render(&mut self, cx: &mut gpui::ViewContext<Self>) -> impl gpui::IntoElement {
         let selected = Global::mapping_selected();
@@ -155,48 +117,7 @@ impl Render for UI {
             .w_full()
             .h_full()
             .bg(Color::Background)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .content_center()
-                    .bg(Color::BackgroundHover)
-                    .text_color(Color::Foreground)
-                    .child(div().w_4())
-                    .child(div().child("Ein-Key"))
-                    .child(div().w_10())
-                    .child(
-                        div()
-                            .when(menu_interactivity.normal(), |div| {
-                                div.on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, cx| save_file(cx, Export)),
-                                )
-                            })
-                            .when(menu_interactivity.normal().not(), |div| {
-                                div.text_color(Color::ForegroundDisabled)
-                            })
-                            .px_3()
-                            .child("Export"),
-                    )
-                    .child(
-                        div()
-                            .when(menu_interactivity.normal(), |div| {
-                                div.on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|_, _, cx| open_file(cx, Import)),
-                                )
-                            })
-                            .when(menu_interactivity.normal().not(), |div| {
-                                div.text_color(Color::ForegroundDisabled)
-                            })
-                            .px_3()
-                            .child("Import"),
-                    )
-                    .child(div().flex_1())
-                    .child(WindowsWindowControls::new()),
-            )
+            .child(render_title_bar(menu_interactivity.normal(), cx))
             .child(
                 div()
                     .w_full()
@@ -238,10 +159,7 @@ impl Interactivity {
     }
 
     pub fn normal(self) -> bool {
-        match self {
-            Self::Normal => true,
-            _ => false,
-        }
+        matches!(self, Self::Normal)
     }
 
     pub fn background(self) -> Color {
@@ -269,7 +187,7 @@ fn optional_stroke(
 ) -> impl IntoElement {
     div()
         .w_full()
-        .min_h_24()
+        .min_h_16()
         .bg(interactivity.background())
         .when(interactivity.normal(), |div| {
             div.hover(|div| div.bg(Color::BackgroundSelected))
@@ -340,8 +258,8 @@ fn create_list_state(global_checker: Model<GlobalChecker>) -> ListState {
                         .flex()
                         .justify_center()
                         .items_center()
-                        .min_w_24()
-                        .min_h_24()
+                        .min_w_16()
+                        .min_h_16()
                         .bg(interactivity.background())
                         .border_2()
                         .rounded(px(15.0))

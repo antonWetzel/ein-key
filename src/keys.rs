@@ -33,10 +33,7 @@ impl Stroke {
                     .filter(|(_, v)| v & SET_BIT != 0)
                     .map(|(idx, _)| VIRTUAL_KEY(idx as u16).name().into())
                     .map(|text| render_key(text, interactivity))
-                    .map(|v| {
-                        modifier = true;
-                        v
-                    }),
+                    .inspect(|_| modifier = true),
             )
             .when(modifier, |div| {
                 div.child(
@@ -93,7 +90,7 @@ impl From<Stroke> for StrokeData {
                 .iter()
                 .copied()
                 .enumerate()
-                .filter_map(|(_, v)| (v & SET_BIT != 0).then_some(v as u8))
+                .filter_map(|(idx, v)| (v & SET_BIT != 0).then_some(idx as u8))
                 .collect(),
         }
     }

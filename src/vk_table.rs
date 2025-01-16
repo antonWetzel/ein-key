@@ -4,9 +4,6 @@ pub trait VirtualKeyExtension {
     fn name(self) -> &'static str;
 }
 
-// https://gist.github.com/kkusch/245bb80ec4e7ab4d8cdc6b7eeb3f330f
-// + regex
-// + case conversion by ai
 impl VirtualKeyExtension for VIRTUAL_KEY {
     fn name(self) -> &'static str {
         match self.0 {
