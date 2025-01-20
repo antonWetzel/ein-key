@@ -8,7 +8,7 @@ use crate::{ui::Interactivity, vk_table::VirtualKeyExtension};
 
 #[derive(Debug, Clone)]
 pub struct Stroke {
-    keyboard: Box<[u8; 256]>,
+    keyboard: Vec<VIRTUAL_KEY>,
     key: VIRTUAL_KEY,
 }
 
@@ -29,10 +29,7 @@ impl Stroke {
                 self.keyboard
                     .iter()
                     .copied()
-                    .enumerate()
-                    .filter(|(_, v)| v & SET_BIT != 0)
-                    .map(|(idx, _)| VIRTUAL_KEY(idx as u16).name().into())
-                    .map(|text| render_key(text, interactivity))
+                    .map(|key| render_key(key.name().into(), interactivity))
                     .inspect(|_| modifier = true),
             )
             .when(modifier, |div| {
@@ -49,7 +46,7 @@ impl Stroke {
 }
 
 impl Stroke {
-    pub fn new(keyboard: Box<[u8; 256]>, key: VIRTUAL_KEY) -> Self {
+    pub fn new(keyboard: Vec<VIRTUAL_KEY>, key: VIRTUAL_KEY) -> Self {
         Self { keyboard, key }
     }
 
@@ -57,7 +54,7 @@ impl Stroke {
         self.key
     }
 
-    pub fn keyboard(&self) -> &[u8; 256] {
+    pub fn keyboard(&self) -> &[VIRTUAL_KEY] {
         &self.keyboard
     }
 }
@@ -70,13 +67,13 @@ pub struct StrokeData {
 
 impl From<StrokeData> for Stroke {
     fn from(stroke_data: StrokeData) -> Self {
-        let mut keyboard = Box::new([0; 256]);
-        for idx in stroke_data.keyboard {
-            keyboard[idx as usize] = SET_BIT;
-        }
         Self {
             key: VIRTUAL_KEY(stroke_data.key),
-            keyboard,
+            keyboard: stroke_data
+                .keyboard
+                .into_iter()
+                .map(|v| VIRTUAL_KEY(v as u16))
+                .collect(),
         }
     }
 }
@@ -85,13 +82,7 @@ impl From<Stroke> for StrokeData {
     fn from(stroke: Stroke) -> Self {
         Self {
             key: stroke.key.0,
-            keyboard: stroke
-                .keyboard
-                .iter()
-                .copied()
-                .enumerate()
-                .filter_map(|(idx, v)| (v & SET_BIT != 0).then_some(idx as u8))
-                .collect(),
+            keyboard: stroke.keyboard.into_iter().map(|k| k.0 as u8).collect(),
         }
     }
 }
@@ -138,7 +129,7 @@ impl Mapping {
         self.input.is_none() && self.output.is_none()
     }
 
-    pub fn status(&self, keyboard: &[u8; 256], key: VIRTUAL_KEY) -> Option<Option<Stroke>> {
+    pub fn status(&self, keyboard: &[VIRTUAL_KEY], key: VIRTUAL_KEY) -> Option<Option<Stroke>> {
         let Some(input) = &self.input else {
             return None;
         };
@@ -147,12 +138,24 @@ impl Mapping {
             return None;
         }
 
-        let valid = input
-            .keyboard
-            .iter()
-            .copied()
-            .zip(keyboard.iter().copied())
-            .all(|(target, current)| current & SET_BIT != 0 || target & SET_BIT == 0);
+        let valid = input.keyboard.iter().copied().all(|key| match key {
+            VK_SHIFT => {
+                keyboard.contains(&VK_SHIFT)
+                    | keyboard.contains(&VK_LSHIFT)
+                    | keyboard.contains(&VK_RSHIFT)
+            }
+            VK_CONTROL => {
+                keyboard.contains(&VK_CONTROL)
+                    | keyboard.contains(&VK_LCONTROL)
+                    | keyboard.contains(&VK_RCONTROL)
+            }
+            VK_MENU => {
+                keyboard.contains(&VK_MENU)
+                    | keyboard.contains(&VK_LMENU)
+                    | keyboard.contains(&VK_RMENU)
+            }
+            _ => keyboard.contains(&key),
+        });
 
         if valid.not() {
             return None;
@@ -161,7 +164,7 @@ impl Mapping {
         Some(self.output.clone())
     }
 
-    pub fn update(&mut self, side: Side, keyboard: Box<[u8; 256]>, key: VIRTUAL_KEY) {
+    pub fn update(&mut self, side: Side, keyboard: Vec<VIRTUAL_KEY>, key: VIRTUAL_KEY) {
         let target = match side {
             Side::Input => &mut self.input,
             Side::Output => &mut self.output,
@@ -221,4 +224,14 @@ pub enum Status {
     Intercept,
     Allow,
     Replace(Vec<INPUT>),
+}
+
+impl std::fmt::Debug for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Intercept => write!(f, "Intercept"),
+            Self::Allow => write!(f, "Allow"),
+            Self::Replace(inputs) => write!(f, "Replace({})", inputs.len()),
+        }
+    }
 }

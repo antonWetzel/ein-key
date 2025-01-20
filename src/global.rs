@@ -1,4 +1,5 @@
 use std::{
+    ops::Not,
     path::PathBuf,
     sync::{LazyLock, Mutex},
 };
@@ -15,7 +16,7 @@ use crate::keys::{KeyState, Mapping, MappingData, Side, Status, Stroke, SET_BIT}
 pub struct Global {
     selected: Option<(usize, Side)>,
     dirty: bool,
-    keyboard: Box<[u8; 256]>,
+    keyboard: Vec<VIRTUAL_KEY>,
 
     mappings: Vec<Mapping>,
     path: PathBuf,
@@ -58,7 +59,7 @@ impl Global {
             selected: None,
             mappings: vec![Mapping::new_empty()],
             dirty: true,
-            keyboard: Box::new([0; 256]),
+            keyboard: Vec::new(),
 
             path: PathBuf::new(),
         }
@@ -164,11 +165,10 @@ impl Global {
         global.selected.is_some()
     }
 
-    fn mapped_key(&self, key: VIRTUAL_KEY) -> Option<Stroke> {
+    fn mapped_key(&self, key: VIRTUAL_KEY) -> Option<Option<Stroke>> {
         self.mappings
             .iter()
             .find_map(|mapping| mapping.status(&self.keyboard, key))
-            .unwrap_or(None)
     }
 
     fn handle_key(&mut self, kb_struct: &KBDLLHOOKSTRUCT) -> Status {
@@ -184,7 +184,7 @@ impl Global {
         };
 
         if state.released() {
-            self.set_key(key, state);
+            self.release_key(key);
         }
 
         let status = match self.selected {
@@ -196,12 +196,13 @@ impl Global {
             Some(_) => Status::Intercept,
             None => match self.mapped_key(key) {
                 None => Status::Allow,
-                Some(stroke) => Status::Replace(self.create_inputs(&stroke, state)),
+                Some(None) => Status::Intercept,
+                Some(Some(stroke)) => Status::Replace(self.create_inputs(&stroke, state)),
             },
         };
 
         if state.pressed() {
-            self.set_key(key, state);
+            self.press_key(key);
         }
         status
     }
@@ -213,7 +214,7 @@ impl Global {
                 ki: KEYBDINPUT {
                     wVk: VIRTUAL_KEY(0),
                     wScan: 0,
-                    dwFlags: KEYBD_EVENT_FLAGS(0),
+                    dwFlags: KEYEVENTF_KEYUP,
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -221,16 +222,50 @@ impl Global {
         };
 
         let mut inputs = Vec::new();
-        for (idx, value) in stroke.keyboard().iter().copied().enumerate() {
-            if value & SET_BIT != self.keyboard[idx] & SET_BIT {
-                input.Anonymous.ki.dwFlags = if value & SET_BIT != 0 {
-                    KEYBD_EVENT_FLAGS(0)
-                } else {
-                    KEYEVENTF_KEYUP
-                };
-                input.Anonymous.ki.wVk = VIRTUAL_KEY(idx as u16);
-                inputs.push(input);
+
+        // release
+        for key in self
+            .keyboard
+            .iter()
+            .copied()
+            .filter(|key| stroke.keyboard().contains(key).not())
+        {
+            match key {
+                VK_SHIFT => {
+                    input.Anonymous.ki.wVk = VK_LSHIFT;
+                    inputs.push(input);
+                    input.Anonymous.ki.wVk = VK_RSHIFT;
+                    inputs.push(input);
+                }
+                VK_CONTROL => {
+                    input.Anonymous.ki.wVk = VK_LCONTROL;
+                    inputs.push(input);
+                    input.Anonymous.ki.wVk = VK_RCONTROL;
+                    inputs.push(input);
+                }
+                VK_MENU => {
+                    input.Anonymous.ki.wVk = VK_LMENU;
+                    inputs.push(input);
+                    input.Anonymous.ki.wVk = VK_RMENU;
+                    inputs.push(input);
+                }
+                _ => {
+                    input.Anonymous.ki.wVk = key;
+                    inputs.push(input);
+                }
             }
+        }
+
+        // press
+        input.Anonymous.ki.dwFlags = KEYBD_EVENT_FLAGS(0);
+        for key in stroke
+            .keyboard()
+            .iter()
+            .copied()
+            .filter(|key| self.keyboard.contains(key).not())
+        {
+            input.Anonymous.ki.wVk = key;
+            inputs.push(input);
         }
 
         input.Anonymous.ki.dwFlags = match state {
@@ -240,7 +275,7 @@ impl Global {
         input.Anonymous.ki.wVk = stroke.key();
         inputs.push(input);
 
-        for idx in (0..(inputs.len() / 2)).rev() {
+        for idx in (0..(inputs.len() - 1)).rev() {
             let mut input = inputs[idx];
             unsafe {
                 input.Anonymous.ki.dwFlags.0 ^= KEYEVENTF_KEYUP.0;
@@ -251,12 +286,50 @@ impl Global {
         inputs
     }
 
-    fn set_key(&mut self, key: VIRTUAL_KEY, state: KeyState) {
-        let value = match state {
-            KeyState::Pressed => SET_BIT,
-            KeyState::Released => 0,
+    fn press_key(&mut self, key: VIRTUAL_KEY) {
+        match key {
+            VK_LSHIFT if self.has_key(VK_RSHIFT) => self.replace_key(VK_RSHIFT, VK_SHIFT),
+            VK_RSHIFT if self.has_key(VK_LSHIFT) => self.replace_key(VK_LSHIFT, VK_SHIFT),
+            VK_LSHIFT | VK_RSHIFT if self.has_key(VK_SHIFT) => {}
+
+            VK_LCONTROL if self.has_key(VK_RCONTROL) => self.replace_key(VK_RCONTROL, VK_CONTROL),
+            VK_RCONTROL if self.has_key(VK_LCONTROL) => self.replace_key(VK_LCONTROL, VK_CONTROL),
+            VK_LCONTROL | VK_RCONTROL if self.has_key(VK_CONTROL) => {}
+
+            VK_LMENU if self.has_key(VK_RMENU) => self.replace_key(VK_RMENU, VK_MENU),
+            VK_RMENU if self.has_key(VK_LMENU) => self.replace_key(VK_LMENU, VK_MENU),
+            VK_LMENU | VK_RMENU if self.has_key(VK_MENU) => {}
+
+            _ if self.keyboard.contains(&key).not() => self.keyboard.push(key),
+            _ => {}
+        }
+    }
+
+    fn has_key(&self, key: VIRTUAL_KEY) -> bool {
+        self.keyboard.contains(&key)
+    }
+
+    fn replace_key(&mut self, old: VIRTUAL_KEY, new: VIRTUAL_KEY) {
+        let Some(v) = self.keyboard.iter_mut().find(|key| **key == old) else {
+            return;
         };
-        self.keyboard[key.0 as usize] = value;
+        *v = new;
+    }
+
+    fn release_key(&mut self, key: VIRTUAL_KEY) {
+        match key {
+            VK_LSHIFT if self.has_key(VK_SHIFT) => self.replace_key(VK_SHIFT, VK_RSHIFT),
+            VK_RSHIFT if self.has_key(VK_SHIFT) => self.replace_key(VK_SHIFT, VK_LSHIFT),
+
+            VK_LCONTROL if self.has_key(VK_CONTROL) => self.replace_key(VK_CONTROL, VK_RCONTROL),
+            VK_RCONTROL if self.has_key(VK_CONTROL) => self.replace_key(VK_CONTROL, VK_LCONTROL),
+
+            VK_LMENU if self.has_key(VK_MENU) => self.replace_key(VK_CONTROL, VK_RMENU),
+            VK_RMENU if self.has_key(VK_MENU) => self.replace_key(VK_CONTROL, VK_LMENU),
+            _ => {
+                self.keyboard.retain_mut(|v| *v != key);
+            }
+        }
     }
 }
 
